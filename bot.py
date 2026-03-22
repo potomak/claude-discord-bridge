@@ -29,6 +29,7 @@ import json
 import logging
 import logging.handlers
 import os
+import re
 import subprocess
 import time
 import uuid
@@ -127,33 +128,24 @@ def extract_permission_text(pane: str) -> str:
                 break
     return "\n".join(out).strip()
 
-def extract_thinking_text(pane: str, baseline: set[str]) -> str:
-    """Extract Claude's streaming text from tmux pane, excluding baseline content.
+# Matches Claude Code's thinking spinner lines, e.g.:
+#   "· Envisioning…"
+#   "✢ Envisioning…"
+#   "✶ Envisioning…"
+#   "* Envisioning… (1m 4s · ↓ 473 tokens)"
+#
+# Glyph set from Claude Code source (PQ_ function):
+#   default:      · (U+00B7)  ✢ (U+2722)  * (U+002A)  ✶ (U+2736)  ✻ (U+273B)  ✿ (U+273D)
+#   ghostty:      · (U+00B7)  ✢ (U+2722)  ✳ (U+2733)  ✶ (U+2736)  ✻ (U+273B)  * (U+002A)
+_SPINNER_RE = re.compile(r'^[·✢✳✶✻✿*] [A-Z][a-z]+ing…')
 
-    baseline is a set of stripped lines captured at request-start time.
-    Only lines that are genuinely new (not in baseline) are returned,
-    preventing old conversation history from leaking into thinking messages.
-    """
-    skip_starts = ("●", "⠼", "⏳", "✓", "✗", "╔", "╗", "╚", "╝", "║",
-                   "─", "✻", "❯", "│", ">", "$", "#", "!")
-    skip_contains = ("Do you want to proceed?", "Yes, and don't ask",
-                     "claude>", BOT_NAME, "[INFO]", "[DEBUG]")
-    lines = pane.strip().split("\n")
-    relevant = []
-    for line in lines[-30:]:
+def find_thinking_spinner(pane: str) -> str | None:
+    """Return the last thinking spinner line visible in the tmux pane, or None."""
+    for line in reversed(pane.split("\n")):
         stripped = line.strip()
-        if not stripped:
-            continue
-        if stripped in baseline:
-            continue
-        if any(stripped.startswith(p) for p in skip_starts):
-            continue
-        if any(s in stripped for s in skip_contains):
-            continue
-        if not any(c.isalnum() for c in stripped):
-            continue
-        relevant.append(stripped)
-    return "\n".join(relevant[-8:])
+        if stripped and _SPINNER_RE.match(stripped):
+            return stripped
+    return None
 
 # ── JSONL helpers ─────────────────────────────────────────────────────────────
 def get_active_jsonl() -> Path | None:
@@ -263,7 +255,6 @@ class ClaudeDiscordBot(discord.Client):
         self._permission_queue: asyncio.Queue = asyncio.Queue()
         self._last_tmux_hash: str = ""
         self._last_think_at: float = 0.0
-        self._pane_baseline: set[str] = set()
         self._last_progress: float = 0.0
         self._response_file: Path | None = None
 
@@ -314,8 +305,6 @@ class ClaudeDiscordBot(discord.Client):
         self._last_progress = time.time()
         self._last_tmux_hash = ""
         self._last_think_at = 0.0
-        pane_now = tmux_capture()
-        self._pane_baseline = {l.strip() for l in pane_now.split("\n") if l.strip()}
 
         # Generate a unique reply file for this request
         self._response_file = Path(f"/tmp/{BOT_NAME}-reply-{uuid.uuid4().hex[:8]}.txt")
@@ -443,23 +432,14 @@ class ClaudeDiscordBot(discord.Client):
                 if time.time() - self._last_think_at >= THINK_TIMEOUT:
                     pane = tmux_capture()
                     if not is_permission_prompt(pane):
-                        thinking_spinner = next(
-                            (l.strip() for l in pane.split("\n")
-                             if l.strip() and ord(l.strip()[0]) > 127 and "…" in l),
-                            None
-                        )
-                        content = extract_thinking_text(pane, self._pane_baseline)
-                        msg = ""
-                        if thinking_spinner:
-                            msg = f"💭 *{thinking_spinner}*"
-                        elif content:
-                            msg = f"💭 *{content[:400]}*"
-                        if msg:
+                        spinner = find_thinking_spinner(pane)
+                        if spinner:
+                            msg = f"💭 *{spinner}*"
                             h = hashlib.md5(msg.encode()).hexdigest()
                             if h != self._last_tmux_hash:
                                 self._last_tmux_hash = h
                                 self._last_think_at = time.time()
-                                log.info(f"Thinking captured: {msg[:80]!r}")
+                                log.info(f"Thinking spinner: {spinner!r}")
                                 await self._request_channel.send(msg)
 
             if self._permission_pending and not self._permission_queue.empty():
