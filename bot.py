@@ -360,7 +360,9 @@ class ClaudeDiscordBot(discord.Client):
                 if self._response_file:
                     self._response_file.unlink(missing_ok=True)
                     self._response_file = None
-                await channel.send("⚠️ Request timed out — no response from Claude after 10 minutes.")
+                mins, secs = divmod(MAX_TURN_DURATION, 60)
+                duration_str = f"{mins}m" if not secs else f"{mins}m {secs}s"
+                await channel.send(f"⚠️ Request timed out — no response from Claude after {duration_str}.")
                 continue
 
             jsonl = get_active_jsonl()
