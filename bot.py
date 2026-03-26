@@ -42,6 +42,7 @@ import uuid
 from pathlib import Path
 
 import discord
+import whisper as _whisper_mod
 from dotenv import load_dotenv
 
 # ── CLI args ───────────────────────────────────────────────────────────────────
@@ -66,9 +67,9 @@ ENABLE_IMAGES      = os.getenv("BOT_ENABLE_IMAGES", "false").lower() == "true"
 LOG_FILE           = Path(os.getenv("BOT_LOG_FILE", f"/tmp/{BOT_NAME}.log"))
 
 # ── Audio transcription capability ────────────────────────────────────────────
-_WHISPER_BIN = shutil.which("whisper")
 _FFMPEG_BIN  = shutil.which("ffmpeg")
-AUDIO_SUPPORT = bool(_WHISPER_BIN and _FFMPEG_BIN)
+AUDIO_SUPPORT = bool(_FFMPEG_BIN)
+_whisper_model = None  # loaded lazily on first audio message
 
 THINK_TIMEOUT      = 4    # seconds of JSONL quiet before capturing tmux for thinking
 STALL_TIMEOUT      = 8    # seconds of JSONL quiet before checking for permission prompt
@@ -251,24 +252,24 @@ def _format_tool_input(name: str, inp: dict) -> str:
     return ""
 
 # ── Audio transcription ───────────────────────────────────────────────────────
+def _load_whisper_model():
+    global _whisper_model
+    if _whisper_model is None:
+        log.info("Loading whisper model (first audio message)...")
+        _whisper_model = _whisper_mod.load_model("base")
+    return _whisper_model
+
 async def _transcribe_audio(path: Path) -> str:
-    """Transcribe an audio file with whisper. Returns the text, or '' on failure."""
-    proc = await asyncio.create_subprocess_exec(
-        _WHISPER_BIN, str(path),
-        "--output_format", "txt",
-        "--output_dir", "/tmp/",
-        "--fp16", "False",
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    _, stderr = await proc.communicate()
-    txt_path = Path("/tmp/") / (path.stem + ".txt")
-    if proc.returncode == 0 and txt_path.exists():
-        result = txt_path.read_text().strip()
-        txt_path.unlink(missing_ok=True)
-        return result
-    log.warning(f"Whisper failed (rc={proc.returncode}): {stderr.decode()[:200]}")
-    return ""
+    """Transcribe an audio file using the whisper Python API. Returns text or ''."""
+    def _run():
+        model = _load_whisper_model()
+        result = model.transcribe(str(path))
+        return result["text"].strip()
+    try:
+        return await asyncio.to_thread(_run)
+    except Exception as e:
+        log.warning(f"Whisper transcription failed for {path.name}: {e}")
+        return ""
 
 # ── Bot ───────────────────────────────────────────────────────────────────────
 class ClaudeDiscordBot(discord.Client):
@@ -356,11 +357,7 @@ class ClaudeDiscordBot(discord.Client):
         ]
         if audio_attachments:
             if not AUDIO_SUPPORT:
-                missing = []
-                if not _WHISPER_BIN:
-                    missing.append("whisper")
-                if not _FFMPEG_BIN:
-                    missing.append("ffmpeg")
+                missing = ["ffmpeg"]
                 await message.channel.send(
                     f"⚠️ Audio attachments are not supported — missing: {', '.join(missing)}."
                 )
