@@ -16,6 +16,11 @@ Configuration (set in your merchant's config/.env or pass --env-file):
     BOT_STARTUP_MSG       — Message posted in Discord on startup
     BOT_ENABLE_IMAGES     — "true" to download image attachments (default: false)
 
+Audio transcription:
+  Audio attachments are transcribed automatically via whisper + ffmpeg when both
+  are present on the system. If either is missing and an audio attachment arrives,
+  the bot replies with an unsupported notice instead of silently dropping it.
+
 Run standalone:
   python3 bot.py --env-file /path/to/config/.env
 
@@ -30,6 +35,7 @@ import logging
 import logging.handlers
 import os
 import re
+import shutil
 import subprocess
 import time
 import uuid
@@ -58,6 +64,11 @@ BOT_NAME           = os.getenv("BOT_NAME") or TMUX_SESSION or "claude-bot"
 BOT_STARTUP_MSG    = os.getenv("BOT_STARTUP_MSG") or f"🤖 {BOT_NAME} online — Claude is listening."
 ENABLE_IMAGES      = os.getenv("BOT_ENABLE_IMAGES", "false").lower() == "true"
 LOG_FILE           = Path(os.getenv("BOT_LOG_FILE", f"/tmp/{BOT_NAME}.log"))
+
+# ── Audio transcription capability ────────────────────────────────────────────
+_WHISPER_BIN = shutil.which("whisper")
+_FFMPEG_BIN  = shutil.which("ffmpeg")
+AUDIO_SUPPORT = bool(_WHISPER_BIN and _FFMPEG_BIN)
 
 THINK_TIMEOUT      = 4    # seconds of JSONL quiet before capturing tmux for thinking
 STALL_TIMEOUT      = 8    # seconds of JSONL quiet before checking for permission prompt
@@ -239,6 +250,26 @@ def _format_tool_input(name: str, inp: dict) -> str:
             return v
     return ""
 
+# ── Audio transcription ───────────────────────────────────────────────────────
+async def _transcribe_audio(path: Path) -> str:
+    """Transcribe an audio file with whisper. Returns the text, or '' on failure."""
+    proc = await asyncio.create_subprocess_exec(
+        _WHISPER_BIN, str(path),
+        "--output_format", "txt",
+        "--output_dir", "/tmp/",
+        "--fp16", "False",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _, stderr = await proc.communicate()
+    txt_path = Path("/tmp/") / (path.stem + ".txt")
+    if proc.returncode == 0 and txt_path.exists():
+        result = txt_path.read_text().strip()
+        txt_path.unlink(missing_ok=True)
+        return result
+    log.warning(f"Whisper failed (rc={proc.returncode}): {stderr.decode()[:200]}")
+    return ""
+
 # ── Bot ───────────────────────────────────────────────────────────────────────
 class ClaudeDiscordBot(discord.Client):
     def __init__(self):
@@ -318,6 +349,35 @@ class ClaudeDiscordBot(discord.Client):
                     await attachment.save(dest)
                     text += f"\n[Image attached: {dest} — please read this file to view it]"
                     log.info(f"Image saved: {dest}")
+
+        audio_attachments = [
+            a for a in message.attachments
+            if a.content_type and a.content_type.startswith("audio/")
+        ]
+        if audio_attachments:
+            if not AUDIO_SUPPORT:
+                missing = []
+                if not _WHISPER_BIN:
+                    missing.append("whisper")
+                if not _FFMPEG_BIN:
+                    missing.append("ffmpeg")
+                await message.channel.send(
+                    f"⚠️ Audio attachments are not supported — missing: {', '.join(missing)}."
+                )
+            else:
+                await message.channel.send("🎙️ Transcribing audio...")
+                for attachment in audio_attachments:
+                    dest = Path(f"/tmp/{BOT_NAME}_{int(time.time())}_{attachment.filename}")
+                    await attachment.save(dest)
+                    log.info(f"Audio saved: {dest}")
+                    transcript = await _transcribe_audio(dest)
+                    dest.unlink(missing_ok=True)
+                    if transcript:
+                        text += f"\n[Audio message transcription: {transcript}]"
+                        log.info(f"Audio transcribed: {transcript[:80]!r}")
+                    else:
+                        text += "\n[Audio message: transcription failed]"
+                        log.warning(f"Transcription failed for {attachment.filename}")
 
         # Append instruction so Claude writes its final reply to the temp file
         text += (
